@@ -1,4 +1,4 @@
-package sqsworker
+package sqsd
 
 type Logger interface {
 	Print(v ...interface{})

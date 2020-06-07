@@ -1,4 +1,4 @@
-package sqshttp
+package sqsd
 
 import (
 	"bytes"
@@ -12,12 +12,11 @@ import (
 	"github.com/aws/aws-sdk-go/service/sqs"
 )
 
-type Client struct {
+type HTTPClient struct {
 	httpClient        *http.Client
 	url               string
 	contentTypeHeader string
-
-	hmacOptions *HMACOptions
+	hmacOptions       *HMACOptions
 }
 
 type HMACOptions struct {
@@ -32,27 +31,23 @@ type Result struct {
 	RetryAfterSec int64
 }
 
-func NewClient(httpClient *http.Client, url string, contentTypeHeader string, HMACOpts *HMACOptions) *Client {
-	return &Client{
+func NewHTTPClient(httpClient *http.Client, url string, contentTypeHeader string, HMACOpts *HMACOptions) *HTTPClient {
+	return &HTTPClient{
 		httpClient:        httpClient,
 		url:               url,
 		contentTypeHeader: contentTypeHeader,
-
-		hmacOptions: HMACOpts,
+		hmacOptions:       HMACOpts,
 	}
 }
 
-func (c *Client) Request(msg *sqs.Message) (*Result, error) {
-	msgID := *msg.MessageId
-	body := *msg.Body
-
-	req, err := http.NewRequest("POST", c.url, bytes.NewBufferString(body))
+func (c *HTTPClient) Request(msg *sqs.Message) (*Result, error) {
+	req, err := http.NewRequest("POST", c.url, bytes.NewBufferString(*msg.Body))
 	if err != nil {
 		return nil, fmt.Errorf("Error creating the HTTP request: %s", err)
 	}
 
 	// Add the X-Aws-Sqsd-Msgid header.
-	req.Header.Add("X-Aws-Sqsd-Msgid", msgID)
+	req.Header.Add("X-Aws-Sqsd-Msgid", *msg.MessageId)
 
 	// Add a X-Aws-Sqsd-Attr-* header for each attribute included on the SQS message.
 	for k, v := range msg.MessageAttributes {
@@ -61,7 +56,7 @@ func (c *Client) Request(msg *sqs.Message) (*Result, error) {
 
 	// If there are HMAC options, add the hash as a header.
 	if c.hmacOptions != nil {
-		hash, err := makeHMAC(fmt.Sprintf("%s%s", c.hmacOptions.Signature, body), c.hmacOptions.Secret)
+		hash, err := makeHMAC(fmt.Sprintf("%s%s", c.hmacOptions.Signature, *msg.Body), c.hmacOptions.Secret)
 		if err != nil {
 			return nil, err
 		}
@@ -79,16 +74,15 @@ func (c *Client) Request(msg *sqs.Message) (*Result, error) {
 		return nil, err
 	}
 
-	res.Body.Close()
-
-	statusCode := res.StatusCode
-	successful := res.StatusCode >= http.StatusOK || res.StatusCode <= http.StatusIMUsed
-	retryAfterSec := getRetryAfterFromResponse(res)
+	err = res.Body.Close()
+	if err != nil {
+		return nil, err
+	}
 
 	return &Result{
-		StatusCode:    statusCode,
-		Successful:    successful,
-		RetryAfterSec: retryAfterSec,
+		StatusCode:    res.StatusCode,
+		Successful:    res.StatusCode >= http.StatusOK || res.StatusCode <= http.StatusIMUsed,
+		RetryAfterSec: getRetryAfterFromResponse(res),
 	}, nil
 }
 

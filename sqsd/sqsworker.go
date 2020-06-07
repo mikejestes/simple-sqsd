@@ -1,7 +1,6 @@
-package sqsworker
+package sqsd
 
 import (
-	"context"
 	"errors"
 	"runtime"
 	"sync"
@@ -9,79 +8,77 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/sqs"
 	"github.com/aws/aws-sdk-go/service/sqs/sqsiface"
-	"github.com/fterrag/simple-sqsd/sqshttp"
 )
 
-type Director struct {
-	mu      sync.Mutex
-	started bool
-	ctx     context.Context
-	canc    context.CancelFunc
-	wg      sync.WaitGroup
-
+type SQSWorker struct {
 	logger     Logger
 	sqs        sqsiface.SQSAPI
-	httpClient sqshttp.Client
+	httpClient HTTPClient
+
+	lock    sync.Mutex
+	started bool
+	wg      sync.WaitGroup
 }
 
-func NewDirector(l Logger, s sqsiface.SQSAPI, c sqshttp.Client) *Director {
-	ctx, cancel := context.WithCancel(context.Background())
-
-	return &Director{
-		ctx:  ctx,
-		canc: cancel,
-
+func NewSQSWorker(l Logger, s sqsiface.SQSAPI, httpClient HTTPClient) *SQSWorker {
+	return &SQSWorker{
 		logger:     l,
 		sqs:        s,
-		httpClient: c,
+		httpClient: httpClient,
 	}
 }
 
-func (d *Director) Start(n int) error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+func (s *SQSWorker) Start(n int) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
-	if d.started {
+	if s.started {
 		return errors.New("already started")
 	}
 
-	d.started = true
+	s.started = true
 
 	if n <= 0 {
 		n = runtime.NumCPU()
 	}
 
-	d.logger.Printf("Starting %d workers", n)
+	if s.logger != nil {
+		s.logger.Printf("Starting %d workers", n)
+	}
+
+	s.wg.Add(n)
 
 	for i := 0; i < n; i++ {
-		go d.worker(i + 1)
+		go s.worker(i + 1)
 	}
 
 	return nil
 }
 
-func (d *Director) Wait() {
-	d.wg.Wait()
+func (s *SQSWorker) Wait() {
+	s.wg.Wait()
 }
 
-func (d *Director) Shutdown() {
-	d.mu.Lock()
-	defer d.mu.Unlock()
+func (s *SQSWorker) Shutdown() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
-	d.logger.Print("Shutting down workers")
-	d.canc()
+	if s.logger != nil {
+		s.logger.Print("Shutting down workers")
+	}
 }
 
-func (d *Director) worker(id int) {
-	d.logger.Printf("Worker #%d starting", id)
-	d.wg.Add(1)
+func (s *SQSWorker) worker(id int) {
+	if s.logger != nil {
+		s.logger.Printf("Worker #%d starting", id)
+	}
 
 	for {
 		select {
-		case <-d.ctx.Done():
-			d.logger.Printf("Worker #%d shutting down", id)
-			d.wg.Done()
-			return
+		// case <-s.ctx.Done():
+		// 	s.logger.Printf("Worker #%d shutting down", id)
+		// 	s.wg.Done()
+		// 	return
 
 		default:
 			recInput := &sqs.ReceiveMessageInput{
@@ -91,9 +88,9 @@ func (d *Director) worker(id int) {
 				MessageAttributeNames: aws.StringSlice([]string{"All"}),
 			}
 
-			output, err := d.sqs.ReceiveMessage(recInput)
+			output, err := s.sqs.ReceiveMessage(recInput)
 			if err != nil {
-				d.logger.Printf("Error while receiving messages from the queue: %s", err)
+				s.logger.Printf("Error while receiving messages from the queue: %s", err)
 				continue
 			}
 
@@ -105,9 +102,9 @@ func (d *Director) worker(id int) {
 			changeVisibilityEntries := make([]*sqs.ChangeMessageVisibilityBatchRequestEntry, 0)
 
 			for _, msg := range output.Messages {
-				res, err := d.httpClient.Request(msg)
+				res, err := s.httpClient.Request(msg)
 				if err != nil {
-					d.logger.Printf("Error making HTTP request: %s", err)
+					s.logger.Printf("Error making HTTP request: %s", err)
 					continue
 				}
 
@@ -120,7 +117,7 @@ func (d *Director) worker(id int) {
 						})
 					}
 
-					d.logger.Printf("Non-successful HTTP status code received: %d", res.StatusCode)
+					s.logger.Printf("Non-successful HTTP status code received: %d", res.StatusCode)
 					continue
 				}
 
@@ -136,9 +133,9 @@ func (d *Director) worker(id int) {
 					// QueueUrl: aws.String(s.workerConfig.QueueURL),
 				}
 
-				_, err = d.sqs.DeleteMessageBatch(delInput)
+				_, err = s.sqs.DeleteMessageBatch(delInput)
 				if err != nil {
-					d.logger.Printf("Error while deleting messages from SQS: %s", err)
+					s.logger.Printf("Error while deleting messages from SQS: %s", err)
 				}
 			}
 
@@ -148,9 +145,9 @@ func (d *Director) worker(id int) {
 					// QueueUrl: aws.String(s.workerConfig.QueueURL),
 				}
 
-				_, err = d.sqs.ChangeMessageVisibilityBatch(changeVisibilityInput)
+				_, err = s.sqs.ChangeMessageVisibilityBatch(changeVisibilityInput)
 				if err != nil {
-					d.logger.Printf("Error while changing visibility on messages: %s", err)
+					s.logger.Printf("Error while changing visibility on messages: %s", err)
 				}
 			}
 		}
